@@ -1,43 +1,46 @@
 import os
 import sys
+import csv
 import time
 import yaml
 import argparse
 import importlib
 import numpy as np
 from tqdm import tqdm
-from scipy import misc
 from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as data
 sys.path.append("..")
-from data import PolypDataset, get_datatrans, get_dataset, get_dataloader
-from utils import set_seed, create_path, get_mdice, clip_gradient, get_mosaic_data, CalParams
+from data import CustomDataset, get_datatrans, get_dataset, get_dataloader
+from utils import create_path, CalParams
 import warnings
 
 warnings.filterwarnings('ignore')
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-
 def run(opt):
-    set_seed(opt['Seed'])
-    opt['Solver']['Batch_Size'] *= len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
-    opt['Solver']['Learning_Rate'] *= len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
-
-    is_yndet = False
-    datatrans = get_datatrans(opt['Solver']['Resize'], is_yndet=is_yndet)
-    dataset = get_dataset(Dataset=PolypDataset, test_root=opt['Path']['TestData_Path'], transform=datatrans,
-                          augmentations=False, is_yndet=is_yndet)
+    create_path(os.path.dirname(os.path.realpath(opt['Path']['Error_Path'])), is_remove=True)
+    datatrans = get_datatrans(opt['Solver']['Resize'])
+    class_indices = None
+    try:
+        if "None" != opt['Solver']['Select']:
+            class_indices = opt['Solver']['Select']
+            if not isinstance(class_indices[0], int):
+               class_indices = [opt['Label_List'].index(label) for label in class_indices]
+    except:
+        pass
+    dataset = get_dataset(Dataset=CustomDataset, test_root=opt['Path']['TestData_Path'], transform=datatrans, augmentations=False, class_indices=class_indices)
     dataloader = get_dataloader(dataset=dataset, batch_size=opt['Solver']['Batch_Size'])
 
     device = 'cuda:{}'.format(opt['Solver']['Device']) if torch.cuda.is_available() else 'cpu'
     create_model = getattr(importlib.import_module('model'), opt['Model']['Module'])
-    model = create_model(module=opt['Model']['Module'],
+    model = create_model(num_classes=len(opt['Label_List']),
+                         module=opt['Model']['Module'],
                          model_name=opt['Model']['Model_Name'],
                          pretrained_weight=None,
-                         deploy=False).to(device)
+                         deploy=opt['Solver']['Deploy']).to(device)
     # print(model)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Number of Model Params (M): %.2f' % (n_parameters / 1.e6))
@@ -48,40 +51,45 @@ def run(opt):
     # input()
     if opt['Solver']['Distributed']:
         model = nn.DataParallel(model)
-    model.load_state_dict(torch.load(os.path.join(opt['Path']['Model_Path'], 'best_mdice_val_model.pth'), map_location=torch.device(device)))
+    model.load_state_dict(torch.load(os.path.join(opt['Path']['Model_Path'], 'best_model.pth'), map_location=torch.device(device)))
     criterion = getattr(importlib.import_module('criterion'), opt['Solver']['Criterion'])()
-
+    csv_file = open(opt['Path']['Error_Path'], 'w', encoding='utf-8')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['path', 'label', 'pred'])
+    label_list = sorted(opt['Label_List'])
+    total_loss, total_acc, total_num = {'test': 0.0}, {'test': 0.0}, {'test': 0}
+    bar, start_time = {'test': tqdm(dataloader['test'])}, time.time()
     model.eval()
-    total_loss, total_mdice = {'test': 0.0}, {'test': 0.0}
-    total_num, bar, start_time = {'test': 0}, {'test': tqdm(dataloader['test'])}, time.time()
     with torch.no_grad():
         for step, sample in enumerate(bar['test']):
             for key in sample.keys():
                 if torch.is_tensor(sample[key]):
-                    sample[key] = sample[key].to(device)
+                    sample[key] = sample[key].to(device, non_blocking=True)
 
             outputs = model(sample['inputs'])
-            if not torch.is_tensor(outputs):
-                outputs = outputs[0]
-            total_loss['test'] += criterion(outputs, sample['targets'])
-            total_mdice['test'] += get_mdice(outputs, sample['targets'])
-            total_num['test'] += 1
 
-            bar['test'].desc = "{} [Test] Step [{:04d}/{:04d}], Loss:{:.5f}, mDice:{:.5f}".format(datetime.now(),
-                                                                            step + 1, len(dataloader['test']),
-                                                                            total_loss['test'] / total_num['test'],
-                                                                            total_mdice['test'] / total_num['test'])
-        print('*****************************************************')
-        avg_loss = {'test': total_loss['test'] / total_num['test']}
-        avg_mdice = {'test': total_mdice['test'] / total_num['test']}
-        print('Test Loss: {:.5f} | Test mDice: {:.5f}'.format(avg_loss['test'], avg_mdice['test']))
-        print('*****************************************************')
-    print('Model Test Time: {:.5f}s'.format(time.time() - start_time))
+            total_loss['test'] += criterion(outputs, sample['targets']).item()
+            total_acc['test'] += (outputs.argmax(dim=1) == sample['targets']).float().sum().item()
+            total_num['test'] += sample['targets'].shape[0]
+
+            bar['test'].desc = "{} [Test], Step [{:04d}/{:04d}], Loss:{:.5f}, Acc:{:.5f}". \
+                format(datetime.now(), step + 1, len(dataloader['test']),
+                       total_loss['test'] / total_num['test'],
+                       total_acc['test'] / total_num['test'], )
+
+            for i in range(len(sample['targets'])):
+                if (outputs[i].argmax() != sample['targets'][i]):
+                    csv_writer.writerow([sample['paths'][i],
+                                         label_list[sample['targets'][i]],
+                                         label_list[outputs[i].argmax()]])
+    print('Model Test Time: {:.5f}s, Loss: {:.5f}, Acc: {:.5f}'.format(time.time() - start_time,
+                                                                       total_loss['test'] / total_num['test'],
+                                                                       total_acc['test'] / total_num['test']))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='../config_kxdet.yaml', help='base config file')
+    parser.add_argument('--config', type=str, default='../config_yndet.yaml', help='config path')
     args = parser.parse_args()
     print('Job Dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("Args: {}".format(args).replace(', ', ',\n'))
